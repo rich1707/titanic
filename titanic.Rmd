@@ -1,0 +1,680 @@
+---
+title: "Predicting Survival on the Titanic"
+author: "Richard Ryan"
+date: '23 April 2022'
+output:
+  html_document:
+    number_section: true 
+    toc: true
+    toc_float: true 
+    theme:
+      bg: "#e8dcda"
+      fg: "black"
+      primary: "blue"
+      base_font:
+        google: "Prompt"
+      code_font:
+        google: "Roboto Mono"
+--- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, paged.print = FALSE)
+```
+
+# Introduction
+
+One of the most interesting features of the Titanic dataset is that it is very easy to make fairly accurate predictions of who survives. For example, if we predict that all males perish and all females survive, we will achieve an accuracy of about 76%. 
+
+As we shall see, improving on that score is not as easy as might first be imagined. In order to improve on the above prediction, we shall have to build a model that predicts females who perish or males who survive. This sounds rather a morbid task but the insights it will provide into human nature are valuable and sometimes even uplifting. 
+
+# Reading in the data
+
+As always, we start by loading the packages we shall need for our analysis:
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(modeest)
+library(vip)
+library(wesanderson)
+```
+
+
+We now read in the data. The dataset we shall use comes from the [OpenML](https://www.openml.org/search?type=data&sort=runs&id=40945&status=active) website, which we have previously downloaded into our working directory.   
+
+
+```{r}
+titanic <- read_csv("titanic3.csv") 
+```
+
+Let's look at the features with which we are to work:
+
+```{r}
+glimpse(titanic)
+```
+
+The `boat` and `body` variables tell us who did or did not survive, so unless they are deleted our model will be rather trivial. We can also delete the `home.dest` feature as that will not figure in our analysis.
+
+```{r}
+titanic <- titanic %>% 
+   select(-boat, -body, -home.dest)
+```
+
+We now need to split our data into training and test sets. We do this to avoid data leakage: we shall delete the survived feature from the test set to ensure that our model does not know more than it should ahead of time. 
+
+To make our results easy to reproduce we set a seed:
+
+```{r}
+set.seed(2022)
+```
+
+We now split our data, using `survived` as the strata variable:
+
+```{r}
+titanic_split <- initial_split(titanic, prop = 0.7, strata = survived)
+```
+
+We can now divide our data into training and test sets:
+
+```{r}
+titanic_train <- training(titanic_split)
+titanic_test <- testing(titanic_split)
+```
+
+We now need to delete the `survived` variable from the test set; but first we need to make a separate dataframe showing who did or did not survive. Obviously this information will be needed to assess our model.
+
+```{r}
+titanic_survived <- titanic_test %>% 
+   select(survived)
+
+titanic_test <- titanic_test %>% 
+   select(-survived)
+```
+
+We can now use `row_bind()` to combine the the `titanic_train` and `titanic_test` datasets for data exploration and feature engineering.  
+
+```{r}
+titanic <- bind_rows(titanic_train, titanic_test)
+```
+
+We can also delete `titanic_train`, `titanic_test` and `titanic_split` as these objects are no longer needed:
+
+```{r}
+remove(titanic_train, titanic_test, titanic_split)
+```
+
+We can now explore our data.
+
+# Data Exploration
+
+The Titanic disaster is well known in popular culture. So before we even begin to look at our data, we will have certain assumptions: for example, we are likely to believe that there were too few life-boats, that women and children were prioritised when positions of these life-boats were allocated, and that there was a rigid class-system in place with regard to the passengers. 
+
+Are these assumptions true? 
+
+## Class and sex
+
+The following graphic suggests that they are, at least in regard to sex and passenger class:
+
+```{r}
+titanic %>% 
+   drop_na(survived) %>% 
+   mutate(pclass = case_when(
+      pclass == 1 ~ "First Class",
+      pclass == 2 ~ "Second Class",
+      TRUE ~ "Third Class"
+   )) %>% 
+   group_by(pclass, sex) %>% 
+   summarise(
+      passengers = n(),
+      survivors = sum(survived),
+      percent_survived = (survivors / passengers) * 100,
+      .groups = "drop"
+   ) %>% 
+   ggplot(aes(x = pclass, y = percent_survived, fill = sex)) + 
+   geom_col(position = "dodge", alpha = 0.5, colour = "black") + 
+   labs(x = NULL, y = NULL, title = "Survivors shown by class and by sex") + 
+   scale_y_continuous(labels = label_percent(scale = 1)) + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 2, type = "discrete"),
+                     labels = c("Female", "Male")) +
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"),
+         legend.text = element_text(face = "bold"),
+         legend.title = element_blank(),
+         legend.position = "bottom")
+   
+```
+
+Clearly a much greater percentage of women survived than men. But what about children? 
+
+## Children
+
+This isn't such an easy question to answer. For a start, the `age` variable is riddled with missing values:
+
+```{r}
+titanic %>% 
+   summarise(missing_age = sum(is.na(age)))
+```
+
+Therefore any conclusions relying on age would have to be tentative. However, with that caveat in place, we can reproduce the above chart with child-adult in place of sex.
+
+```{r}
+titanic %>% 
+   drop_na(age, survived) %>% 
+   mutate(pclass = case_when(
+      pclass == 1 ~ "First-Class",
+      pclass == 2 ~ "Second-Class",
+      TRUE ~ "Third-Class"
+   )) %>% 
+   mutate(maturity = if_else(age < 18, "child", "adult")) %>% 
+   mutate(maturity = factor(maturity, levels = c("child", "adult"))) %>% 
+   group_by(pclass, maturity) %>% 
+   summarise(
+      passengers = n(),
+      survivors = sum(survived),
+      percent_survived = (survivors / passengers) * 100,
+      .groups = "drop"
+   ) %>% 
+   ggplot(aes(x = pclass, y = percent_survived, fill = maturity)) + 
+   geom_col(position = "dodge", alpha = 0.5, colour = "black") + 
+   labs(x = NULL, y = NULL, 
+        title = "Child vs adult survivors across all passenger classes") + 
+   scale_y_continuous(labels = label_percent(scale = 1)) + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 2, type = "discrete"),
+                     labels = c("Child", "Adult")) + 
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"),
+         legend.text = element_text(face = "bold"),
+         legend.title = element_blank(),
+         legend.position = "bottom")
+```
+
+This is very interesting data. We can see that children have a better chance of survival than adults in all three passenger classes. 
+
+At this point we need to remember that our goal is (1) to find males who survive; and (2) to find females who perish. An obvious way to find males who survive is to find a method of identifying male children.
+
+Once again, we are faced with the problem of incomplete data with regard to `age`. We could perhaps impute the `age` variable; but a better method is to find a proxy value. Consider therefore the `name` variable, where male children are given the title *master*. If we can extract the title, then in theory we should have a reliable list of male children. 
+
+## Passenger titles
+
+There is, of course, a problem with this approach. The following code extracts the title of all male passengers under the age of 18. We would expect `Master` to be the only title returned; but this in not the case: 
+
+```{r}
+titanic %>% 
+   filter(sex == "male" & age < 18) %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)")) %>% 
+   count(title)
+```
+
+We have males under the age of 18 who have the title of `Mr`. This needs further investigation, but for now let's create a separate category for these passengers and plot the results, assigning any titles that are neither `Mr` or `Master` to the category `Other`. The `Other` category is for values like `Dr` and `Count`, but no harm is done if we lump them all together. 
+
+Males under the age of 18 and with the title `Mr` will be assigned the new title `Mr_Child`.
+
+```{r, warning=FALSE}
+titanic %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)")) %>% 
+   filter(sex == "male") %>% 
+   drop_na(age, survived) %>% 
+   mutate(title = if_else(title == "Mr" & age < 18, "Mr_Child", title)) %>% 
+   mutate(title = as.factor(title)) %>% 
+   mutate(title = fct_lump_min(title, min = 10)) %>% 
+   mutate(title = fct_relevel(title, levels = c("Master", "Other", "Mr", "Mr_Child"))) %>% 
+   group_by(title) %>% 
+   summarise(
+      passengers = n(),
+      survivors = sum(survived),
+      percent_survived = (survivors / passengers) * 100
+   ) %>%
+   ggplot(aes(x = title, y = percent_survived, fill = title)) + 
+   geom_col(alpha = 0.5, show.legend = FALSE, colour = "black") + 
+   labs(x = NULL, y = NULL, 
+        title = "Showing the survival rates across the categories of male passengers") + 
+   scale_y_continuous(labels = label_percent(scale = 1)) + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 4, type = "discrete")) + 
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"))
+   
+```
+
+Here we see that using the `age` variable would actually mislead us. The category we have labelled `Mr_Child` has by far the worst survival rate. What is going on here? 
+
+This isn't any easy question to answer, but the following output might help us make an educated guess: 
+
+```{r}
+titanic %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)")) %>% 
+   filter(sex == "male", title == "Mr", age < 18) %>% 
+   select(name, age, parch, survived) %>% 
+   drop_na(survived) %>% 
+   arrange(-parch)
+```
+
+The `parch` variable gives the number of parents or children travelling with the passenger in question. It's reasonable to assume that none of these passengers were travelling with children, so the `parch` feature indicates the parents of the passenger. Here only two passengers travelled (we assume) with both parents.
+
+This suggests to me that the oldest male in the family group was given the title of `Mr` in certain situations. An obvious situation is when the person in question is married. Perhaps more common, at least in this context, would be cases where there is no father in the family group and the eldest male child takes that role upon himself along with the title of `Mr`. 
+
+In any case, once the title of `Mr` was bestowed, it seems the child in question was obliged to put himself at the back of the queue for the lifeboats regardless of his age. Once in this position, it would seem that these passengers lacked the physical maturity to compete for the last places remaining on the lifeboats and were unable to save themselves by other means.
+
+Is there any difference between categories of female? We can start to answer this question by looking at the various female titles:
+
+```{r}
+titanic %>% 
+   filter(sex == "female") %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)")) %>% 
+   count(title, name = "totals") %>% 
+   arrange(-totals)
+```
+
+Once again, we shall lump the less common factors together as `Other`. Here it is not easy to identify children, as `Miss` is used for any unmarried female, child or not. We must also recognise that some people under the age of 18 will be married. Nevertheless, our data does not have to be perfect to guide our analysis in the right direction.
+
+```{r, warning=FALSE}
+titanic %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)")) %>% 
+   filter(sex == "female") %>% 
+   drop_na(age, survived) %>% 
+   mutate(title = if_else(title == "Miss" & age < 18, "Miss_Child", title)) %>% 
+   mutate(title = as.factor(title)) %>% 
+   mutate(title = fct_lump_min(title, min = 10)) %>% 
+   mutate(title = fct_relevel(title, levels = c("Other", "Mrs", "Miss", "Miss_Child"))) %>% 
+   group_by(title) %>% 
+   summarise(
+      passengers = n(),
+      survivors = sum(survived),
+      percent_survived = (survivors / passengers) * 100
+   ) %>% 
+   ggplot(aes(x = title, y = percent_survived, fill = title)) + 
+   geom_col(alpha = 0.5, show.legend = FALSE, colour = "black") + 
+   labs(x = NULL, y = NULL, 
+        title = "Showing the survival rates across the categories of female passengers") + 
+   scale_y_continuous(labels = label_percent(scale = 1)) + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 4, type = "discrete")) + 
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"))
+```
+
+It is interesting that the female children we have identified have the lowest survival rate. This seems to contradict our earlier finding that children stood a better chance of survival than their adult counterparts. However, this is easily explained. Consider the following plot:
+
+```{r}
+titanic %>% 
+   filter(age < 18) %>% 
+   mutate(pclass = case_when(
+      pclass == 1 ~ "First Class",
+      pclass == 2 ~ "Second Class",
+      TRUE ~ "Third Class"
+   )) %>% 
+   count(pclass, name = "passengers") %>% 
+   ggplot(aes(x = pclass, y = passengers, fill = pclass)) + 
+   geom_col(alpha = 0.5, show.legend = FALSE, colour = "black") + 
+   labs(x = NULL, y = NULL, 
+        title = "Showing the total number of children travelling in each class") + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 3, type = "discrete")) +
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"))
+```
+
+Therefore, although children were more likely to survive than adults in the same passenger class, their overall survival rate was compromised because most travelled in third class.
+
+## Families
+
+Another obvious question is to ask who fares better between single people and those in a family group. The following plot seems to show that passengers in families tend to do better:
+
+```{r}
+titanic %>% 
+   drop_na(survived) %>% 
+   mutate(family_size = sibsp + parch) %>% 
+   mutate(single = if_else(family_size > 0, "Part of a family", "Single traveller")) %>% 
+   mutate(pclass = case_when(
+      pclass == 1 ~ "First-Class",
+      pclass == 2 ~ "Second-Class",
+      TRUE ~ "Third-Class"
+   )) %>% 
+   group_by(pclass, single) %>% 
+   summarise(
+      passengers = n(),
+      survivors = sum(survived),
+      percent_survived = (survivors / passengers) * 100,
+      .groups = "drop"
+   ) %>% 
+   ggplot(aes(x = pclass, y = percent_survived, fill = single)) + 
+   geom_col(position = "dodge", alpha = 0.5, colour = "black") + 
+   labs(x = NULL, y = NULL, 
+        title = "Showing the survival rate of single travellers vs families") +
+   scale_y_continuous(labels = scales::percent_format(scale = 1)) + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 2, type = "discrete")) + 
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold"),
+         legend.text = element_text(face = "bold"),
+         legend.title = element_blank(),
+         legend.position = "bottom")
+```
+
+But we must remember that most single passengers are adult males, so we would expect their survival rate to be lower. Nevertheless, as we shall see, the family group will play a large part in our model. We shall leave the details until the feature engineering stage of our workflow.
+
+Our task now is to clean up our data before engineering the features we will need to build an accurate model.
+
+# Data Cleaning
+
+As we saw in the previous section, some of the features in our dataset contain missing values. How bad is the problem?
+
+```{r}
+titanic %>% 
+   select(-survived) %>% 
+   map_dfr(function(.x) tibble(
+      totals = length(.x),
+      total_NAs = sum(is.na(.x))
+   ),
+      .id = "variable") %>% 
+   arrange(-total_NAs)
+```
+
+The percent missing from the `cabin` variable is overwhelming. There would be nothing wrong with dropping this feature, but we could instead turn it into a `factor` showing whether a `cabin` number had been recorded. Thus:
+
+```{r}
+titanic <- titanic %>% 
+   mutate(cabin_recorded = if_else(is.na(cabin), "no", "yes")) %>% 
+   select(-cabin)
+```
+
+As we have seen, we are better off replacing `age` with a `title` variable. We shall retain the `age` variable as we shall need it when feature engineering. 
+
+```{r}
+titanic <- titanic %>% 
+   mutate(title = str_extract(name, pattern = "[a-zA-Z]+(?=\\.)"))
+```
+
+The missing values for `embarked` can be replaced with the mode:
+
+```{r}
+titanic <- titanic %>% 
+   mutate(embarked = replace_na(embarked, mfv(embarked)))
+```
+
+The single `NA` in the `fare` variable can be replaced with the median value for the relevant passenger class. We shall also need to take into account the number of people who were travelling on the same ticket:
+
+```{r}
+titanic <- titanic %>% 
+   group_by(pclass, sibsp, parch) %>% 
+   mutate(fare = replace_na(fare, median(fare, na.rm = TRUE))) %>% 
+   ungroup()
+```
+
+Our data is now as clean as it needs to be and we can move on to the next step. 
+
+# Feature engineering
+
+Feature engineering is even more important than usual on this dataset. Using the features in the form in which they are provided wil lnot produce the best results. Instead we have to get creative, building new features to better model our insights into the data.
+
+## Real Fare
+
+Consider the `fare` variable. As things stand, this feature isn't particularly useful; it gives us the price of the ticket but doesn't tell us how many people the ticket covers. We can start, therefore, by engineering a `real_fare` variable:
+
+```{r}
+titanic <- titanic %>% 
+   mutate(total_family = 1 + sibsp + parch) %>% 
+   mutate(real_fare = fare / total_family) %>%
+   select(-total_family)
+```
+
+This feature is, in effect, a more nuanced version of `pclass`. The basic idea is that, given the importance of passenger class, we can reasonably expect a similar bias within each class based on ticket price. 
+
+## Passenger titles
+
+As we have seen above, we are much better using a proxy for the `age` variable. So far we have extracted the title but quite a bit more work needs to be done. We can start by sorting the titles into the categories behind our earlier plots.
+
+To do this we convert the `title` variable to a `factor` and use `fct_lump_min()` to combine the less common titles into a single category `Other`. The problem now is that `Other` will cover both male and female passengers, so we convert back to `character` and change according to sex. In this way `title` will act as a proxy for both `age` and `sex`. 
+
+```{r}
+titanic <- titanic %>% 
+   mutate(title = as.factor(title)) %>% 
+   mutate(title = fct_lump_min(title, min = 10)) %>% 
+   mutate(title = as.character(title)) %>% 
+   mutate(title = case_when(
+      sex == "male" & title == "Other" ~ "Male_Other",
+      sex == "female" & title == "Other" ~ "Female_Other",
+      TRUE ~ title
+   )) 
+```
+
+We also need to create variables for children whenever possible:
+
+```{r}
+titanic %>% 
+   mutate(title = case_when(
+      title == "Mr" & age < 18 ~ "Mr_Child",
+      title == "Miss" & age < 18 ~ "Miss_Child",
+      TRUE ~ title
+   )) %>% count(title, name = "passengers") %>% 
+   arrange(-passengers)
+```
+
+As we shall see, the `title` variable will be the important feature of our model.
+
+## Family groups
+
+The next feature we need to engineer is also highly important. As far as I'm aware, the basic idea behind this feature was first outlined in [this](https://www.kaggle.com/code/cdeotte/titanic-using-name-only-0-81818/notebook) contribution on Kaggle. The reasoning here is simple: when a group of people travelled as a family they tended to survive or perish as a unit. We exclude from this observation anyone with the title `Mr`, `Mr_Child` and `Male_Other`, as we know that different rules applied to these passengers. 
+
+Arranging the passengers into family units is no easy task. An obvious approach is to consider any group of people as a family if, and only if, they have the same surname and are travelling on the same ticket. The advantage of this approach is that it is easy to implement, but we must recognise that our results will not be totally accurate. Not all family members will have the same name, and not all family members will travel on the same ticket. 
+
+Trying to identify family members with different surnames might introduce an unwelcome element of subjectivity into our analysis. With regard to the ticket, however, there is perhaps a simple way of making our grouping of family members more accurate. Of course not all family members will share the same ticket number, but we would expect the ticket numbers to be related. As such, we can replace the last letter of each ticket with an *X*. 
+
+So let us first extract the surname of each passenger and modify the ticket information:
+
+```{r}
+titanic <- titanic %>% 
+   mutate(surname = str_extract(name, pattern = ".+(?=,)")) %>% 
+   mutate(ticket = str_replace(ticket, ".$", "X"))
+```
+
+We then construct a helper dataframe, from which adult males and single travellers are excluded:
+
+```{r}
+helper_tbl <- titanic %>% 
+   filter(!title %in% c("Mr", "Mr_Child", "Male_Other")) %>% 
+   group_by(surname, ticket) %>% 
+   mutate(family_size = n()) %>% 
+   ungroup() %>% 
+   filter(family_size > 1)
+```
+
+We then group the passengers into families using `surname` and `ticket` and calculate the ratio of survivors in each group:
+
+```{r}
+helper_tbl <- helper_tbl %>% 
+   group_by(surname, ticket) %>% 
+   mutate(known_family_size = sum(!is.na(survived))) %>% 
+   mutate(known_family_survived = sum(survived, na.rm = TRUE)) %>% 
+   mutate(ratio = known_family_survived / known_family_size)
+```
+
+We then lump these groups into categories according as all known family members survived, some known family members survived, or no known family members survived. We also need an `unknown` level, as a few families have all their members in our test dataset.  
+
+```{r}
+helper_tbl <- helper_tbl %>% 
+   mutate(family_survived = case_when(
+      ratio == 0 ~ "none",
+      ratio == 1 ~ "all",
+      ratio < 1 & ratio > 0 ~ "some",
+      TRUE ~ "unknown"
+   ))
+```
+
+We delete from our `helper_tbl` all the values we will no longer need:
+
+```{r}
+helper_tbl <- helper_tbl %>% 
+   select(-family_size, -known_family_size, -known_family_survived, -ratio)
+```
+
+We now join our `help_tbl` to the main dataset, replacing any `NA` values as needed:
+
+```{r}
+titanic <- left_join(titanic, helper_tbl) %>% 
+   mutate(family_survived = replace_na(family_survived, "single"))
+```
+
+We can now start building our model.
+
+# Building a model
+
+First we split the data:
+
+```{r}
+titanic_train <- filter(titanic, !is.na(survived))
+titanic_test <- filter(titanic, is.na(survived))
+```
+
+Next we prepare cross-validation folds for tuning our model:
+
+```{r}
+titanic_cv_folds <- vfold_cv(titanic_train, v = 10, strata = survived)
+```
+
+We use the `recipe()` function for data preprocessing:
+
+```{r}
+titanic_recipe <- titanic_train %>% 
+   recipe(survived ~ title + family_survived + real_fare + embarked + cabin_recorded) %>% 
+   step_mutate(survived = as.factor(survived), skip = TRUE) %>% 
+   step_string2factor(all_nominal_predictors()) %>% 
+   step_unknown(all_nominal_predictors()) %>% 
+   step_normalize(all_numeric_predictors())
+```
+
+In our model specification we declare the kind of algorithm we wish to use, in this case `rand_forest()`; we also say which hyper-parameters we wish to tune. Next we set the engine, *i.e.* the package implementing the algorithm. We also state whether the problem is one of *regression* or *classification* - here it is classification as we are predicting on a binary outcome.
+
+```{r}
+titanic_spec <- rand_forest(
+   mtry = tune(), trees = tune(), min_n = tune()) %>% 
+   set_engine("ranger", importance = "impurity") %>% 
+   set_mode("classification")
+```
+
+We then combine our recipe and our model specification into a `workflow`. This isn't essential but does make the modelling (and tuning) process much easier:
+
+```{r}
+titanic_workflow <- workflow() %>% 
+   add_recipe(titanic_recipe) %>% 
+   add_model(titanic_spec)
+```
+
+Tuning hyper-parameters is a time-consuming business so we utilise all of the cores on our machine:
+
+```{r}
+doParallel::registerDoParallel()
+```
+
+We also set a seed:
+
+```{r}
+set.seed(2022)
+```
+
+Now we tune our model specification:
+
+```{r}
+titanic_tune <- tune_grid(
+   titanic_workflow,
+   resamples = titanic_cv_folds,
+   grid = 30
+)
+```
+
+Having tuned our model specification, we select the hyper-parameters that provide the best accuracy.
+
+```{r}
+titanic_hypers <- select_best(titanic_tune, "accuracy")
+```
+
+We then finalize our workflow.
+
+```{r}
+final_titanic_workflow <- finalize_workflow(titanic_workflow, titanic_hypers)
+```
+
+All that remains here is to fit our model:
+
+```{r}
+titanic_model <- fit(final_titanic_workflow, data = titanic_train)
+```
+
+# Evaluation
+
+We now have a model. First let's look at the most important features:
+
+```{r}
+titanic_model %>% 
+   extract_fit_engine() %>% 
+   vi() %>% mutate(Variable = factor(
+      Variable, 
+      levels = c("title", "family_survived", "real_fare", "cabin_recorded", "embarked"))) %>% 
+   ggplot(aes(x = fct_rev(Variable), y = Importance, fill = Variable)) + 
+   geom_col(alpha = 0.5, show.legend = FALSE, colour = "black") + 
+   labs(y = NULL, x = NULL, title = "Showing the importance of each variable to our model") + 
+   scale_fill_manual(values = wes_palette(name = "Cavalcanti1", n = 5, type = "discrete")) +
+   theme(axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         plot.title = element_text(face = "bold")) + 
+   coord_flip()
+```
+
+Of course the big question is how well this model performs on unseen data. Therefore we predict on `titanic_test` and assess using the `accuracy()` function from the `yardstick` package.
+
+```{r}
+titanic_preds <- predict(titanic_model, new_data = titanic_test)
+```
+
+Having produced a dataframe of predictions, we need to `col_bind()` on our `titanic_survived` dataframe. We convert the `survived` feature to a `factor` and assess our results:
+
+```{r}
+titanic_preds <- bind_cols(titanic_preds, titanic_survived) %>% 
+   mutate(survived = as.factor(survived)) %>% 
+   rename(preds = .pred_class)
+
+titanic_preds %>% accuracy(survived, preds)
+```
+
+The consensus on [Kaggle](https://www.kaggle.com/competitions/titanic/discussion) suggests that accuracy of 0.80 is a very good result. Of course, our data-split will differ from that used on Kaggle, so our results are perhaps not directly comparable. Nevertheless, we can still consider it a respectable performance.  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
